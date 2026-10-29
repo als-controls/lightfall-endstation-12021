@@ -1,41 +1,33 @@
 """ophyd device for Princeton Instruments PI-MTE cameras via the PICam C API.
 
-Talks to the camera directly through ``Picam.dll`` with ctypes -- no EPICS IOC and
-no LightField. LightField must be CLOSED while this device holds the camera
-(PICam allows a single owner per camera).
+Talks to the camera directly through ``Picam.dll`` (see :mod:`.picam`) -- no EPICS IOC
+and no LightField. PICam allows a single owner per camera, so LightField must be closed
+while this device holds it; :meth:`PIMTEDetector.release_camera` hands it back.
 
-Layout mirrors an areaDetector-style detector so it slots into Bluesky plans::
+The component layout follows ophyd's areaDetector naming so Lightfall's camera widgets
+and plans (``simple_acquire``, TV mode, dark frames) work unchanged::
 
     det = PIMTEDetector(name="mte", serial="02062413",
                         write_dir=r"D:\\data\\mte",            # where this PC writes
                         read_dir="/mnt/beamline/data/mte")   # same dir as the Tiled server sees it
-    det.acquire_time.set(0.5)          # seconds
+    det.cam.acquire_time.set(0.5)      # seconds
     RE(bp.count([det], num=3))
 
-Images are never put inline in events. Each stage() opens one HDF5 file
-(SWMR, dataset ``/entry/data/data``, one chunk per frame) and emits a
-``StreamResource``; each trigger() appends a frame and emits a ``StreamDatum``.
-The descriptor marks ``<name>_image`` as ``external: "STREAM:"`` so TiledWriter's
-HDF5Consolidator registers the file with Tiled. ``read_dir`` must be a location the
-Tiled server can read (and be within its readable_storage).
+Images are never put inline in events. Each stage() opens one HDF5 file (SWMR, dataset
+``/entry/data/data``, one chunk per trigger) and emits a ``StreamResource``; each
+trigger() appends and emits a ``StreamDatum``. The descriptor marks ``<name>_image`` as
+``external: "STREAM:"`` for TiledWriter's HDF5Consolidator. ``read_dir`` must be a
+location the Tiled server can read (and be within its readable_storage).
 
-Outside a staged run (e.g. a quick look from a panel) trigger() just acquires and
-leaves the frame(s) in ``det.last_image``; no file or documents are produced.
+Components:
+    cam.*            acquisition/camera settings (PICam-backed), areaDetector names
+    image.array_data latest frame for live display (omitted from documents)
 
-Data keys:
-    <name>_image           external STREAM:, uint16 (H, W) or (N, H, W) if num_images > 1
+Outside a staged run, ``cam.acquire.put(1)`` free-runs per ``cam.image_mode``
+(Single / Multiple / Continuous) for live view; no files or documents are produced.
 
-Signals (kind):
-    temperature            normal  sensor temperature reading [degC] (online read)
-    acquire_time           config  exposure [s]
-    num_images             config  frames per trigger
-    temperature_setpoint   config  [degC]  -- WARNING: lowering this starts cooling;
-                                    only cool an in-vacuum MTE when it is under vacuum.
-    temperature_status     config  "Locked"/"Unlocked"
-    adc_speed              config  [MHz]
-    shutter_mode           config  "Normal", "Always Closed", "Always Open", ...
-    trigger_response       config  "No Response", "Readout Per Trigger", ...
-    readout_time           config  calculated readout time [s] (read-only)
+Cooling: setpoints below ``SAFE_SETPOINT`` (20 degC) are refused unless
+``det.allow_cooling`` is True. Only cool an in-vacuum MTE when it is under vacuum.
 """
 from __future__ import annotations
 
@@ -54,63 +46,237 @@ from event_model import StreamRange, compose_stream_resource
 from ophyd import Component as Cpt
 from ophyd import Device, Signal
 from ophyd.status import DeviceStatus
-from ophyd.utils import ReadOnlyError
+from ophyd.utils import DisconnectedError, ReadOnlyError
 
-from lightfall_endstation_12021.devices.picam import PicamCamera
+from lightfall_endstation_12021.devices.picam import PicamCamera, PicamError
 
 logger = logging.getLogger(__name__)
 
+SAFE_SETPOINT = 20.0   # degC; below this requires allow_cooling
+DETECTOR_IDLE, DETECTOR_ACQUIRE, DETECTOR_ERROR, DETECTOR_DISCONNECTED = 0, 1, 6, 9
+IMAGE_MODES = ["Single", "Multiple", "Continuous"]
 
-class PicamParamSignal(Signal):
-    """Signal backed by a PICam parameter on the parent detector's driver."""
 
-    def __init__(self, *, param: str, scale: float = 1.0, online: bool = False,
-                 read_only: bool = False, units: str | None = None, **kwargs):
-        self._param, self._scale, self._online = param, scale, online
-        self._read_only, self._units = read_only, units
+def _changed(old, new) -> bool:
+    try:
+        return bool(old != new)
+    except Exception:   # numpy arrays etc.
+        return True
+
+
+class _StateSignal(Signal):
+    """Soft signal the device updates internally (always notifies on change)."""
+
+    def _update(self, value):
+        old = self._readback
+        self._readback = value
+        self._metadata["timestamp"] = time.time()
+        if _changed(old, value):
+            self._run_subs(sub_type=self.SUB_VALUE, old_value=old, value=value,
+                           timestamp=self._metadata["timestamp"])
+
+
+class _EnumSoftSignal(Signal):
+    """Soft integer signal with ``enum_strs`` (accepts index or label on put)."""
+
+    def __init__(self, *, enum_strs, **kwargs):
+        self._enum_strs = tuple(enum_strs)
         super().__init__(**kwargs)
 
     @property
-    def _driver(self) -> PicamCamera:
-        return self.root.driver
+    def enum_strs(self):
+        return self._enum_strs
+
+    def put(self, value, **kwargs):
+        if isinstance(value, str):
+            value = self._enum_strs.index(value)
+        super().put(int(value), **kwargs)
+
+    def describe(self):
+        desc = super().describe()
+        desc[self.name]["enum_strs"] = list(self._enum_strs)
+        return desc
+
+
+class PicamParamSignal(Signal):
+    """Signal backed by a PICam parameter on the root detector's driver.
+
+    ``enum=True`` exposes an enumerated parameter as an integer index into
+    ``enum_strs`` (the camera's allowed choices), like an EPICS mbbo.
+    """
+
+    def __init__(self, *, param: str, scale: float = 1.0, online: bool = False,
+                 read_only: bool = False, units: str | None = None, enum: bool = False,
+                 **kwargs):
+        self._param, self._scale, self._online = param, scale, online
+        self._read_only, self._units, self._enum = read_only, units, enum
+        self._enum_cache: tuple[str, ...] | None = None
+        super().__init__(**kwargs)
+
+    @property
+    def connected(self) -> bool:
+        return not self.root.released   # lazily opens on first read
+
+    @property
+    def enum_strs(self):
+        if not self._enum:
+            return None
+        if self._enum_cache is None:
+            self._enum_cache = tuple(self.root.driver.enum_choices(self._param))
+        return self._enum_cache
+
+    def _raw_to_value(self, raw):
+        if self._enum:
+            return self.enum_strs.index(raw) if raw in self.enum_strs else raw
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and self._scale != 1.0:
+            return raw * self._scale
+        return raw
 
     def get(self, **kwargs):
-        drv = self._driver
+        det = self.root
+        drv = det.driver
         if self._online and drv.acquiring and self._readback is not None:
-            # don't poke the hardware mid-readout; report the last value
-            return self._readback
-        val = drv.get(self._param, online=self._online)
-        if isinstance(val, (int, float)) and not isinstance(val, bool) and self._scale != 1.0:
-            val = val * self._scale
+            return self._readback      # cached while the camera is busy
+        val = self._raw_to_value(drv.get(self._param, online=self._online))
+        old = self._readback
         self._readback = val
         self._metadata["timestamp"] = time.time()
+        if _changed(old, val):
+            self._run_subs(sub_type=self.SUB_VALUE, old_value=old, value=val,
+                           timestamp=self._metadata["timestamp"])
         return val
 
     def put(self, value, **kwargs):
         if self._read_only:
             raise ReadOnlyError(f"{self.name} is read-only")
-        raw = value / self._scale if isinstance(value, (int, float)) and self._scale != 1.0 else value
-        self._driver.set(self._param, raw)
-        super().put(self.get(), **kwargs)   # publish the value the camera actually accepted
+        if self._enum:
+            raw = value if isinstance(value, str) else self.enum_strs[int(value)]
+        elif isinstance(value, (int, float)) and self._scale != 1.0:
+            raw = value / self._scale
+        else:
+            raw = value
+        self.root._check_put(self, raw)
+        self.root.driver.set(self._param, raw)
+        self.get()                   # publish the value the camera actually accepted
 
     def describe(self):
         desc = super().describe()
         if self._units:
             desc[self.name]["units"] = self._units
+        if self._enum:
+            desc[self.name]["enum_strs"] = list(self.enum_strs)
         return desc
+
+
+class _RoiSignal(PicamParamSignal):
+    """One field of the (single) PICam ROI."""
+
+    def __init__(self, *, field: str, **kwargs):
+        self._field = field
+        super().__init__(param="ROIs", **kwargs)
+
+    def get(self, **kwargs):
+        val = self.root.driver.get_roi()[self._field]
+        old = self._readback
+        self._readback = val
+        self._metadata["timestamp"] = time.time()
+        if _changed(old, val):
+            self._run_subs(sub_type=self.SUB_VALUE, old_value=old, value=val,
+                           timestamp=self._metadata["timestamp"])
+        return val
+
+    def put(self, value, **kwargs):
+        if self._read_only:
+            raise ReadOnlyError(f"{self.name} is read-only")
+        det = self.root
+        if det._writer is not None:
+            raise RuntimeError("Cannot change ROI while staged")
+        roi = det.driver.get_roi()
+        roi[self._field] = int(value)
+        det.driver.set_roi(**roi)
+        det._refresh_roi_signals()
+
+
+class _AcquireSignal(_StateSignal):
+    """``cam.acquire``: put 1 to free-run per image_mode, 0 to stop."""
+
+    def put(self, value, **kwargs):
+        det = self.root
+        if int(value):
+            det._start_free_run()
+        else:
+            det._request_stop()
+
+
+class _ShutterControlSignal(Signal):
+    """``cam.shutter_control`` as used by Lightfall dark-frame plans: 0 closed, 1 normal."""
+
+    @property
+    def connected(self) -> bool:
+        return not self.root.released   # lazily opens on first read
+
+    def get(self, **kwargs):
+        closed = self.root.driver.get("Shutter Timing Mode") == "Always Closed"
+        self._readback = 0 if closed else 1
+        return self._readback
+
+    def put(self, value, **kwargs):
+        mode = "Always Closed" if int(value) == 0 else "Normal"
+        self.root.cam.shutter_mode.put(mode)
+        super().put(int(bool(int(value))), **kwargs)
+
+
+class PIMTECam(Device):
+    """Camera settings, named after ophyd's AreaDetectorCam where an equivalent exists."""
+
+    acquire = Cpt(_AcquireSignal, value=0, kind="omitted")
+    detector_state = Cpt(_StateSignal, value=DETECTOR_DISCONNECTED, kind="omitted")
+    array_counter = Cpt(_StateSignal, value=0, kind="omitted")
+    image_mode = Cpt(_EnumSoftSignal, enum_strs=IMAGE_MODES, value=0, kind="config")
+    num_images = Cpt(Signal, value=1, kind="config")
+
+    acquire_time = Cpt(PicamParamSignal, param="Exposure Time", scale=1e-3, units="s", kind="config")
+    readout_time = Cpt(PicamParamSignal, param="Readout Time Calculation", scale=1e-3,
+                       read_only=True, units="s", kind="config")
+    adc_speed = Cpt(PicamParamSignal, param="ADC Speed", units="MHz", kind="config")
+    shutter_mode = Cpt(PicamParamSignal, param="Shutter Timing Mode", enum=True, kind="config")
+    shutter_control = Cpt(_ShutterControlSignal, value=1, kind="omitted")
+    trigger_response = Cpt(PicamParamSignal, param="Trigger Response", enum=True, kind="config")
+
+    temperature = Cpt(PicamParamSignal, param="Sensor Temperature Reading", online=True,
+                      read_only=True, units="degC", kind="normal")
+    temperature_setpoint = Cpt(PicamParamSignal, param="Sensor Temperature Set Point",
+                               units="degC", kind="config")
+    temperature_status = Cpt(PicamParamSignal, param="Sensor Temperature Status", online=True,
+                             read_only=True, kind="config")
+
+    min_x = Cpt(_RoiSignal, field="x", kind="config")
+    min_y = Cpt(_RoiSignal, field="y", kind="config")
+    size_x = Cpt(_RoiSignal, field="width", kind="config")
+    size_y = Cpt(_RoiSignal, field="height", kind="config")
+    bin_x = Cpt(_RoiSignal, field="x_binning", kind="config")
+    bin_y = Cpt(_RoiSignal, field="y_binning", kind="config")
+    max_size_x = Cpt(PicamParamSignal, param="Sensor Active Width", read_only=True, kind="config")
+    max_size_y = Cpt(PicamParamSignal, param="Sensor Active Height", read_only=True, kind="config")
+
+
+class PIMTEImage(Device):
+    """Live-view image (latest frame); never part of event documents."""
+
+    array_data = Cpt(_StateSignal, value=np.zeros((1, 1), dtype="<u2"), kind="omitted")
 
 
 class _HDF5FrameWriter:
     """One SWMR HDF5 file per staged run, plus the matching StreamResource/StreamDatum docs."""
 
     def __init__(self, path: Path, uri: str, data_key: str, frame_shape: tuple[int, ...],
-                 dataset: str, attrs: dict):
+                 dtype: np.dtype, dataset: str, attrs: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path, self.frame_shape = path, frame_shape
         self._file = h5py.File(path, "w", libver="latest")
         self._ds = self._file.create_dataset(
             dataset, shape=(0, *frame_shape), maxshape=(None, *frame_shape),
-            chunks=(1, *frame_shape), dtype="<u2")
+            chunks=(1, *frame_shape), dtype=dtype)
         for k, v in attrs.items():
             self._ds.attrs[k] = v
         self._file.swmr_mode = True
@@ -152,45 +318,105 @@ class PIMTEDetector(Device, Triggerable):
     read_dir : the same directory as seen by the Tiled server (POSIX or Windows path);
                defaults to ``write_dir``
     dataset : HDF5 dataset path for the frames
+    poll_period : seconds between temperature polls while connected (0 disables)
     """
 
-    temperature = Cpt(PicamParamSignal, param="Sensor Temperature Reading", online=True,
-                      read_only=True, units="degC", kind="normal")
-
-    acquire_time = Cpt(PicamParamSignal, param="Exposure Time", scale=1e-3, units="s", kind="config")
-    num_images = Cpt(Signal, value=1, kind="config")
-    temperature_setpoint = Cpt(PicamParamSignal, param="Sensor Temperature Set Point",
-                               units="degC", kind="config")
-    temperature_status = Cpt(PicamParamSignal, param="Sensor Temperature Status", online=True,
-                             read_only=True, kind="config")
-    adc_speed = Cpt(PicamParamSignal, param="ADC Speed", units="MHz", kind="config")
-    shutter_mode = Cpt(PicamParamSignal, param="Shutter Timing Mode", kind="config")
-    trigger_response = Cpt(PicamParamSignal, param="Trigger Response", kind="config")
-    readout_time = Cpt(PicamParamSignal, param="Readout Time Calculation", scale=1e-3,
-                       read_only=True, units="s", kind="config")
+    cam = Cpt(PIMTECam, "", kind="normal")
+    image = Cpt(PIMTEImage, "", kind="omitted")
 
     def __init__(self, *args, serial: str | None = None,
                  write_dir: str | os.PathLike = Path.home() / "lightfall" / "data" / "pi_mte",
-                 read_dir: str | None = None,
-                 dataset: str = "/entry/data/data", **kwargs):
+                 read_dir: str | None = None, dataset: str = "/entry/data/data",
+                 poll_period: float = 2.0, **kwargs):
         self._serial = serial
         self._driver: PicamCamera | None = None
+        self._released = False
+        self._open_lock = threading.Lock()
         self.write_dir = Path(write_dir)
         self.read_dir = read_dir
         self.dataset = dataset
+        self.poll_period = poll_period
+        self.allow_cooling = False
         self._writer: _HDF5FrameWriter | None = None
         self._acq_thread: threading.Thread | None = None
+        self._poll_stop = threading.Event()
+        self._poll_thread: threading.Thread | None = None
         self.last_image: np.ndarray | None = None
         super().__init__(*args, **kwargs)
 
-    # ---- camera
+    # ---- camera ownership
+    @property
+    def camera_connected(self) -> bool:
+        return self._driver is not None and self._driver.is_open
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
     @property
     def driver(self) -> PicamCamera:
-        """Open the camera lazily on first use so instantiation never grabs it from LightField."""
+        """The open camera. Opens lazily unless released via :meth:`release_camera`."""
         if self._driver is None:
-            self._driver = PicamCamera(self._serial)
+            if self._released:
+                raise DisconnectedError(
+                    f"{self.name}: camera released; call connect_camera() to reconnect")
+            self._open()
         return self._driver
 
+    def _open(self):
+        with self._open_lock:
+            if self._driver is not None:
+                return
+            self._driver = PicamCamera(self._serial)
+            for sig in (self.cam.shutter_mode, self.cam.trigger_response):
+                sig._enum_cache = None
+            self.cam.detector_state._update(DETECTOR_IDLE)
+            if self.poll_period:
+                self._poll_stop.clear()
+                self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True,
+                                                     name=f"{self.name}-poll")
+                self._poll_thread.start()
+
+    def connect_camera(self):
+        """(Re)connect to the camera, e.g. after LightField has been closed."""
+        self._released = False
+        self._open()
+
+    def release_camera(self):
+        """Stop, close the camera and stay disconnected until :meth:`connect_camera`."""
+        if self._writer is not None:
+            raise RuntimeError("Cannot release the camera while staged")
+        self._released = True
+        self._close_driver()
+
+    def _close_driver(self):
+        self._poll_stop.set()
+        if self._driver is not None:
+            self._driver.close()
+            self._driver = None
+        if self._acq_thread is not None:
+            self._acq_thread.join(30)
+        self.cam.acquire._update(0)
+        self.cam.detector_state._update(DETECTOR_DISCONNECTED)
+
+    def _poll_loop(self):
+        while not self._poll_stop.wait(self.poll_period):
+            drv = self._driver
+            if drv is None or not drv.is_open:
+                return
+            try:
+                self.cam.temperature.get()
+                self.cam.temperature_status.get()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s poll failed: %s", self.name, exc)
+
+    def _check_put(self, sig, raw):
+        if sig is self.cam.temperature_setpoint and float(raw) < SAFE_SETPOINT and not self.allow_cooling:
+            raise PermissionError(
+                f"Setpoint {raw} degC is below {SAFE_SETPOINT} degC. Cooling an in-vacuum MTE "
+                f"is only safe under vacuum; set {self.name}.allow_cooling = True to permit it.")
+
+    # ---- geometry
     @property
     def image_key(self) -> str:
         return f"{self.name}_image"
@@ -199,12 +425,17 @@ class PIMTEDetector(Device, Triggerable):
         if self._writer is not None:
             raise RuntimeError("Cannot change ROI while staged")
         self.driver.set_roi(x, y, width, height, x_binning, y_binning)
+        self._refresh_roi_signals()
+
+    def _refresh_roi_signals(self):
+        for attr in ("min_x", "min_y", "size_x", "size_y", "bin_x", "bin_y"):
+            getattr(self.cam, attr).get()
 
     def frame_shape(self) -> tuple[int, ...]:
         """Shape of the data produced by one trigger()."""
         if self._writer is not None:
             return self._writer.frame_shape
-        n = int(self.num_images.get())
+        n = int(self.cam.num_images.get())
         hw = self.driver.image_shape()
         return (n, *hw) if n > 1 else hw
 
@@ -225,7 +456,7 @@ class PIMTEDetector(Device, Triggerable):
             local, uri = self._file_paths()
             d = self.driver
             self._writer = _HDF5FrameWriter(
-                local, uri, self.image_key, self.frame_shape(), self.dataset,
+                local, uri, self.image_key, self.frame_shape(), d.dtype, self.dataset,
                 attrs={"model": d.model, "serial": d.serial, "sensor": d.sensor})
             logger.info("%s writing %s", self.name, local)
         except Exception:
@@ -247,7 +478,7 @@ class PIMTEDetector(Device, Triggerable):
             "source": f"PICAM:{self.driver.serial}",
             "dtype": "array",
             "shape": list(self.frame_shape()),
-            "dtype_numpy": "<u2",
+            "dtype_numpy": self.driver.dtype.str,
             "external": "STREAM:",
         }
         return desc
@@ -260,39 +491,68 @@ class PIMTEDetector(Device, Triggerable):
             yield pending.popleft()
 
     # ---- acquisition
-    def trigger(self):
+    def _launch(self, n: int | None, writer: _HDF5FrameWriter | None) -> DeviceStatus:
+        """Run an acquisition of ``n`` frames (None = continuous) in a worker thread."""
+        if self._acq_thread is not None and self._acq_thread.is_alive():
+            raise RuntimeError(f"{self.name} is already acquiring")
+        drv = self.driver
         status = DeviceStatus(self)
-        n = int(self.num_images.get())
-        writer = self._writer
+        per_trigger = int(self.cam.num_images.get()) if writer is not None else 1
+        batch: list[np.ndarray] = []
 
-        def _run():
+        def on_frame(img: np.ndarray, i: int):
+            self.last_image = img
+            self.image.array_data._update(img)
+            self.cam.array_counter._update(self.cam.array_counter.get() + 1)
+            if writer is not None:
+                batch.append(img)
+                if len(batch) == per_trigger:
+                    writer.write(batch[0] if per_trigger == 1 else np.stack(batch))
+                    batch.clear()
+
+        def run():
+            self.cam.acquire._update(1)
+            self.cam.detector_state._update(DETECTOR_ACQUIRE)
+            state = DETECTOR_IDLE
             try:
-                frames = self.driver.acquire(n)
-                data = frames[0] if n == 1 else frames
-                self.last_image = data
-                if writer is not None:
-                    writer.write(data)
+                got = drv.run(n, on_frame)
+                if n is not None and got < n:
+                    raise PicamError(f"Acquisition stopped after {got} of {n} frames")
                 status.set_finished()
             except Exception as exc:
-                logger.exception("PI-MTE acquisition failed")
+                state = DETECTOR_ERROR if self._driver is not None else DETECTOR_DISCONNECTED
+                logger.error("%s acquisition failed: %s", self.name, exc)
                 status.set_exception(exc)
+            finally:
+                self.cam.acquire._update(0)
+                self.cam.detector_state._update(state)
 
-        self._acq_thread = threading.Thread(target=_run, name=f"{self.name}-acquire", daemon=True)
+        self.cam.array_counter._update(0)
+        self._acq_thread = threading.Thread(target=run, name=f"{self.name}-acquire", daemon=True)
         self._acq_thread.start()
         return status
 
-    def stop(self, *, success=False):
+    def trigger(self):
+        return self._launch(int(self.cam.num_images.get()), self._writer)
+
+    def _start_free_run(self):
+        mode = int(self.cam.image_mode.get())
+        n = {0: 1, 1: int(self.cam.num_images.get()), 2: None}[mode]
+        self._launch(n, None)
+
+    def _request_stop(self):
         if self._driver is not None:
-            self._driver.stop()
+            self._driver.request_stop()
+
+    def stop(self, *, success=False):
+        self._request_stop()
         super().stop(success=success)
 
     def close(self):
-        """Release the camera (e.g. to hand it back to LightField)."""
+        """Release resources (camera handle, open file). Lazily reopens on next use."""
         if self._writer is not None:
             self.unstage()
-        if self._driver is not None:
-            self._driver.close()
-            self._driver = None
+        self._close_driver()
 
     def destroy(self):
         self.close()

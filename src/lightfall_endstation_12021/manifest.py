@@ -2,6 +2,7 @@
 
 Defines all Lightfall plugins provided by this package:
 - Device backend plugin shipping the endstation happi database (PI-MTE camera, ...)
+- Controller plugin for the PI-MTE camera widget
 """
 
 from lightfall.plugins.manifest import PluginEntry, PluginManifest
@@ -16,6 +17,13 @@ manifest = PluginManifest(
             type_name="device_backend",
             name="endstation_12021_devices",
             import_path="lightfall_endstation_12021.devices.backend:Endstation12021Devices",
+        ),
+        # Controller plugin: PI-MTE camera widget
+        PluginEntry(
+            type_name="controller",
+            name="pimte_picam_camera",
+            import_path="lightfall_endstation_12021.widgets.pimte:PIMTEControllerPlugin",
+            metadata={"priority": 160},
         ),
     ],
 )

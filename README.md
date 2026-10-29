@@ -12,6 +12,10 @@ beamline-specific functionality, registered via the `lightfall.plugins` entry po
 - **Endstation device database** (`devices/devices.json`) — packaged happi database,
   added to Lightfall's device catalog by the `endstation_12021_devices` device-backend
   plugin.
+- **PI-MTE camera widget** (`widgets.pimte.PIMTEControllerPlugin`) — Lightfall's
+  plan-based camera widget (live view, TV mode, dark frames) plus temperature panel
+  and a PI-MTE panel: Connect/Release (to share the camera with LightField), trigger,
+  ADC speed, binning, readout time, and the allow-cooling interlock.
 
 ## PI-MTE notes
 
@@ -19,12 +23,22 @@ beamline-specific functionality, registered via the `lightfall.plugins` entry po
   `C:\Program Files\Common Files\Princeton Instruments\Picam\Runtime`, or set
   `PICAM_RUNTIME`.
 - PICam allows one owner per camera: **close LightField** before using the device.
-  The device opens the camera lazily (first read/stage/trigger) and `det.close()`
-  releases it.
+  The device opens the camera lazily (first read/stage/trigger).
+  `det.release_camera()` (or **Release** in the widget) closes it and keeps it closed
+  until `det.connect_camera()` / **Connect**, so LightField can use it meanwhile.
+  Disabling the device in Lightfall's device tree does *not* release the camera.
+- Signals follow areaDetector names under `det.cam` (`acquire_time` in seconds,
+  `num_images`, `image_mode`, `acquire`, `shutter_mode`, `bin_x`, ...);
+  `det.image.array_data` holds the latest frame for live view only.
+- Acquisition is asynchronous (own circular buffer + `Picam_StartAcquisition` /
+  `Picam_WaitForAcquisitionUpdate`): frames stream as they arrive, continuous mode
+  works, and stop takes effect within ~0.1 s even mid-readout.
+- `python scripts/evaluate_picam.py` characterizes the driver on the live camera.
 - `write_dir` is where this PC writes HDF5; `read_dir` is the same location as the
   Tiled server sees it (must be within the server's readable storage).
-- Lowering `temperature_setpoint` starts cooling. Only cool the in-vacuum MTE when it
-  is under vacuum.
+- Lowering `cam.temperature_setpoint` starts cooling. Only cool the in-vacuum MTE when
+  it is under vacuum. Setpoints below 20 °C are refused unless `det.allow_cooling` is
+  True (the widget's "Allow cooling" checkbox, which asks for confirmation).
 
 ## Installation
 
