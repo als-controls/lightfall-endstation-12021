@@ -1,0 +1,21 @@
+{
+  "mte": {
+    "_id": "mte",
+    "name": "mte",
+    "type": "OphydItem",
+    "active": true,
+    "device_class": "lightfall_endstation_12021.devices.PIMTEDetector",
+    "args": [],
+    "kwargs": {
+      "name": "{{name}}",
+      "serial": "02062413",
+      "write_dir": "C:/Users/admin/lightfall/data/pi_mte"
+    },
+    "beamline": "12.0.2.1",
+    "display_name": "PI-MTE 2048B",
+    "group": "Detectors",
+    "documentation": "Princeton Instruments PI-MTE: 2048B (e2v CCD 42-40, back-illuminated, 2048x2048, 13.5 um) on USB 2.0, s/n 02062413. Driven directly through PICam (ctypes); LightField must be closed. Writes SWMR HDF5 + StreamResource/StreamDatum. read_dir (Tiled-server-visible path) is not set yet -- see TODO.",
+    "creation": "Thu Oct 29 17:00:00 2026",
+    "last_edit": "Thu Oct 29 17:00:00 2026"
+  }
+}
