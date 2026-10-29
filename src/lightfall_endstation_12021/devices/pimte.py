@@ -49,6 +49,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import h5py
 import numpy as np
+from bluesky.protocols import Triggerable
 from event_model import StreamRange, compose_stream_resource
 from ophyd import Component as Cpt
 from ophyd import Device, Signal
@@ -138,8 +139,11 @@ class _HDF5FrameWriter:
             self._file = None
 
 
-class PIMTEDetector(Device):
+class PIMTEDetector(Device, Triggerable):
     """Princeton Instruments PI-MTE (or other PICam camera) as an ophyd detector.
+
+    ``Triggerable`` is listed explicitly so Lightfall's MRO-based category inference
+    classifies this as a detector (plan forms filter detector choices by category).
 
     Parameters
     ----------

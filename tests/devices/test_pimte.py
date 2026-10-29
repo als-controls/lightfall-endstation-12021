@@ -199,6 +199,12 @@ def test_packaged_happi_entry_instantiates_without_hardware():
     assert dev._serial == "02062413"
 
 
+def test_lightfall_classifies_as_detector():
+    happi_backend = pytest.importorskip("lightfall.devices.backends.happi")
+    detector = happi_backend.DeviceCategory.DETECTOR
+    assert happi_backend._guess_category_from_mro(PIMTEDetector) == detector
+
+
 def test_manifest_entry_point_resolves():
     eps = [ep for ep in entry_points(group="lightfall.plugins") if ep.name == "lightfall_endstation_12021"]
     if not eps:
