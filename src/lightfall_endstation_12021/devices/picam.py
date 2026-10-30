@@ -95,6 +95,7 @@ _P = C.POINTER
 _SIGNATURES = {
     "Picam_InitializeLibrary": [],
     "Picam_UninitializeLibrary": [],
+    "Picam_IsLibraryInitialized": [_P(pibln)],
     "Picam_GetVersion": [_P(C.c_int)] * 4,
     "Picam_GetEnumerationString": [C.c_int, C.c_int, _P(C.c_char_p)],
     "Picam_DestroyString": [C.c_char_p],
@@ -143,6 +144,7 @@ class _PicamLib:
     _lock = threading.Lock()
     _dll = None
     _refs = 0
+    _owns_init = False   # False if PICam was already initialized in-process by someone else
 
     @classmethod
     def acquire(cls):
@@ -155,9 +157,15 @@ class _PicamLib:
                     fn.argtypes, fn.restype = argtypes, C.c_int
                 cls._dll = dll
             if cls._refs == 0:
-                err = cls._dll.Picam_InitializeLibrary()
-                if err:
-                    raise PicamError(f"Picam_InitializeLibrary failed ({err})", err)
+                inited = pibln()
+                cls._dll.Picam_IsLibraryInitialized(C.byref(inited))
+                if inited.value:
+                    cls._owns_init = False      # borrow; don't uninitialize on release
+                else:
+                    err = cls._dll.Picam_InitializeLibrary()
+                    if err:
+                        raise PicamError(f"Picam_InitializeLibrary failed ({err})", err)
+                    cls._owns_init = True
             cls._refs += 1
             return cls._dll
 
@@ -167,8 +175,9 @@ class _PicamLib:
             if cls._refs <= 0:
                 return
             cls._refs -= 1
-            if cls._refs == 0 and cls._dll is not None:
+            if cls._refs == 0 and cls._dll is not None and cls._owns_init:
                 cls._dll.Picam_UninitializeLibrary()
+                cls._owns_init = False
 
 
 # --------------------------------------------------------------------------- driver

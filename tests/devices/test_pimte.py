@@ -336,6 +336,28 @@ def test_poller_publishes_temperature(tmp_path, fake):
     d.close()
 
 
+def test_destroy_releases_camera(tmp_path, fake):
+    d = PIMTEDetector(name="mte", write_dir=tmp_path, poll_period=0.05)
+    d.connect_camera()
+    drv = d._driver
+    d.destroy()                      # what Lightfall calls when the device is disabled
+    assert not drv.is_open and d._driver is None
+
+
+def test_dropping_last_reference_releases_camera(tmp_path, fake):
+    import gc
+
+    d = PIMTEDetector(name="mte", write_dir=tmp_path, poll_period=0.05)
+    d.connect_camera()
+    drv, poller = d._driver, d._poll_thread
+    assert poller.is_alive()
+    del d
+    gc.collect()
+    assert not drv.is_open           # __del__ ran despite the running poller
+    poller.join(2)
+    assert not poller.is_alive()
+
+
 @pytest.mark.parametrize("read_dir, prefix", [
     ("/mnt/beamline/data/mte", "file:///mnt/beamline/data/mte/"),
     (r"\\fileserver\share\mte", "file://fileserver/share/mte/"),

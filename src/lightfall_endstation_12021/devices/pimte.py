@@ -36,6 +36,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -372,9 +373,12 @@ class PIMTEDetector(Device, Triggerable):
                 sig._enum_cache = None
             self.cam.detector_state._update(DETECTOR_IDLE)
             if self.poll_period:
-                self._poll_stop.clear()
-                self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True,
-                                                     name=f"{self.name}-poll")
+                # Fresh stop event per poller; the thread holds only a weak reference so
+                # it never keeps the detector alive (lets __del__ release the camera).
+                self._poll_stop = threading.Event()
+                self._poll_thread = threading.Thread(
+                    target=_poll_loop, args=(weakref.ref(self), self._poll_stop, self.poll_period),
+                    daemon=True, name=f"{self.name}-poll")
                 self._poll_thread.start()
 
     def connect_camera(self):
@@ -398,17 +402,6 @@ class PIMTEDetector(Device, Triggerable):
             self._acq_thread.join(30)
         self.cam.acquire._update(0)
         self.cam.detector_state._update(DETECTOR_DISCONNECTED)
-
-    def _poll_loop(self):
-        while not self._poll_stop.wait(self.poll_period):
-            drv = self._driver
-            if drv is None or not drv.is_open:
-                return
-            try:
-                self.cam.temperature.get()
-                self.cam.temperature_status.get()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("%s poll failed: %s", self.name, exc)
 
     def _check_put(self, sig, raw):
         if sig is self.cam.temperature_setpoint and float(raw) < SAFE_SETPOINT and not self.allow_cooling:
@@ -555,5 +548,38 @@ class PIMTEDetector(Device, Triggerable):
         self._close_driver()
 
     def destroy(self):
+        """ophyd teardown (called by Lightfall when the device is disabled/removed)."""
         self.close()
         super().destroy()
+
+    def __del__(self):
+        # Last-resort release of the camera if the object is dropped without
+        # destroy()/close(). Must never raise.
+        try:
+            if self._driver is not None:
+                self._poll_stop.set()
+                self._driver.request_stop()
+                self._driver.close()
+                self._driver = None
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _poll_loop(det_ref, stop: threading.Event, period: float):
+    """Temperature poller; exits when stopped, the camera closes, or the device is gone."""
+    while not stop.wait(period):
+        det = det_ref()
+        if det is None:
+            return
+        drv = det._driver
+        if drv is None or not drv.is_open:
+            return
+        try:
+            det.cam.temperature.get()
+            det.cam.temperature_status.get()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%s poll failed: %s", det.name, exc)
+        del det
