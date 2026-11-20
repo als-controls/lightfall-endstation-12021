@@ -13,7 +13,9 @@ and plans (``simple_acquire``, TV mode, dark frames) work unchanged::
 
 By default files go to ``<data_root>/<tiled_beamline>/pi_mte`` on this PC and are
 referenced as ``/data/<tiled_beamline>/pi_mte`` (the Tiled server's view, where
-shussebora copies them); explicit ``write_dir`` / ``read_dir`` override that.
+shussebora copies them); explicit ``write_dir`` / ``read_dir`` override that. After each
+file is closed (``unstage``), shussebora is told through
+``lightfall.services.shussebora_files.notify_files_closed``.
 
 Images are never put inline in events. Each stage() opens one HDF5 file (SWMR, dataset
 ``/entry/data/data``, one chunk per trigger) and emits a ``StreamResource``; each
@@ -57,6 +59,24 @@ from lightfall_endstation_12021.devices.picam import PicamCamera, PicamError
 logger = logging.getLogger(__name__)
 
 DETECTOR_DIR = "pi_mte"   # per-detector directory under <data_root>/<beamline>/
+
+
+def _notify_files_closed(paths: list[str]) -> None:
+    """Tell shussebora the files are complete. Never raises.
+
+    Older Lightfall versions lack the helper; then shussebora's catch-up moves the files.
+    """
+    try:
+        from lightfall.services.shussebora_files import notify_files_closed
+    except ImportError:
+        logger.debug("lightfall.services.shussebora_files unavailable; not notifying shussebora")
+        return
+    try:
+        notify_files_closed(paths)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("shussebora file.closed notification failed: %s", exc)
+
+
 SAFE_SETPOINT = 20.0   # degC; below this requires allow_cooling
 DETECTOR_IDLE, DETECTOR_ACQUIRE, DETECTOR_ERROR, DETECTOR_DISCONNECTED = 0, 1, 6, 9
 IMAGE_MODES = ["Single", "Multiple", "Continuous"]
@@ -495,8 +515,10 @@ class PIMTEDetector(Device, Triggerable):
         if self._acq_thread is not None:
             self._acq_thread.join()
         if self._writer is not None:
+            path = self._writer.path
             self._writer.close()
             self._writer = None
+            _notify_files_closed([str(path)])
         return super().unstage()
 
     def describe(self):

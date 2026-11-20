@@ -45,6 +45,25 @@ beamline-specific functionality, registered via the `lightfall.plugins` entry po
   it is under vacuum. Setpoints below 20 °C are refused unless `det.allow_cooling` is
   True (the widget's "Allow cooling" checkbox, which asks for confirmation).
 
+## Data movement
+
+[shussebora](https://git.als.lbl.gov/ncs/shussebora) runs as a Windows service on the
+beamline PC with source root `D:/data`. It copies each file to bcgtiled under the same
+relative path (`/data/12.0.2.1/pi_mte/YYYY/MM/DD/...`), which is the `read_dir` the
+StreamResource documents point at, and prunes the local copy after its retention.
+
+There is no EPICS file plugin for shussebora to watch, so the device tells it directly:
+`unstage` (which also runs after an abort or stop) closes the HDF5 file and calls
+`lightfall.services.shussebora_files.notify_files_closed([path])`. That sends a
+`<prefix>.file.closed` NATS request to the shussebora instance whose source root covers
+the path. It never blocks or fails the run; a missed notification is picked up by
+shussebora's catch-up pass. With an older Lightfall that lacks the helper, nothing is
+sent and catch-up alone moves the files.
+
+Planned, not wired yet (waiting on the Crucible project mapping): Lightfall's
+`CrucibleIngestor` in external mode with `path_map=[("/data", "D:/data")]`, so its
+claims name the local paths shussebora knows and the uploads go through shussebora.
+
 ## Installation
 
 ```bash
