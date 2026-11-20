@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
+import types
 from importlib import resources
 from importlib.metadata import entry_points
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -14,6 +17,7 @@ from event_model import DocumentNames, StreamRange, compose_run, schema_validato
 from ophyd.utils import DisconnectedError
 
 from lightfall_endstation_12021.devices import PIMTEDetector
+from lightfall_endstation_12021.devices import paths as paths_mod
 from lightfall_endstation_12021.devices import pimte as pimte_mod
 
 
@@ -368,6 +372,120 @@ def test_read_dir_uri_mapping(tmp_path, read_dir, prefix):
     local, uri = d._file_paths()
     assert uri.startswith(prefix) and uri.endswith(local.name)
     assert local.is_relative_to(tmp_path.resolve())
+
+
+@pytest.fixture(autouse=True)
+def notified(monkeypatch):
+    """Replace lightfall.services.shussebora_files with a recorder (any Lightfall version).
+
+    Autouse so no test reaches the real helper (and its NATS monitor).
+    """
+    calls = []
+    mod = types.ModuleType("lightfall.services.shussebora_files")
+    mod.notify_files_closed = lambda paths: calls.append(list(paths))
+    monkeypatch.setitem(sys.modules, "lightfall.services.shussebora_files", mod)
+    return calls
+
+
+@pytest.fixture
+def beamline(monkeypatch):
+    """Set the tiled_beamline preference seen by devices.paths."""
+    value = {"bl": "12.0.2.1"}
+    monkeypatch.setattr(paths_mod, "_beamline", lambda: value["bl"])
+    return value
+
+
+def test_unstage_notifies_shussebora_with_closed_path(det, notified):
+    det.stage()
+    det.trigger().wait(5)
+    path = det._writer.path
+    assert notified == []
+    det.unstage()
+    assert notified == [[str(path)]]
+    with h5py.File(path, "r") as f:           # closed and complete when announced
+        assert f["/entry/data/data"].shape[0] == 1
+
+
+def test_unstage_notifies_after_aborted_acquisition(det, notified):
+    det.cam.num_images.put(3)
+    det.stage()
+    path = det._writer.path
+    det.driver.gate = threading.Event()
+    st = det.trigger()
+    _wait(lambda: det.driver.acquiring)
+    det.stop()                                 # abort mid-acquisition
+    det.driver.gate.set()
+    with pytest.raises(Exception):
+        st.wait(5)
+    det.unstage()
+    assert notified == [[str(path)]]
+
+
+def test_notify_errors_do_not_break_unstage(det, monkeypatch):
+    mod = types.ModuleType("lightfall.services.shussebora_files")
+
+    def boom(paths):
+        raise RuntimeError("bus down")
+
+    mod.notify_files_closed = boom
+    monkeypatch.setitem(sys.modules, "lightfall.services.shussebora_files", mod)
+    det.stage()
+    det.unstage()
+    assert det._writer is None
+
+
+def test_unstage_without_helper_module(det, monkeypatch):
+    monkeypatch.setitem(sys.modules, "lightfall.services.shussebora_files", None)  # ImportError
+    det.stage()
+    det.unstage()
+    assert det._writer is None
+
+
+def test_unstage_without_stage_does_not_notify(det, notified):
+    det.unstage()
+    assert notified == []
+
+
+def test_default_dirs_follow_tiled_beamline_at_stage_time(tmp_path, fake, beamline, notified):
+    d = PIMTEDetector(name="mte", data_root=tmp_path, poll_period=0)
+    beamline["bl"] = "12.0.2.1"                # preference set after construction
+    d.stage()
+    local = d._writer.path
+    uri = d._writer.pending[0][1]["uri"]
+    d.unstage()
+    assert local.is_relative_to((tmp_path / "12.0.2.1" / "pi_mte").resolve())
+    rel = local.relative_to((tmp_path / "12.0.2.1" / "pi_mte").resolve()).as_posix()
+    assert uri == f"file:///data/12.0.2.1/pi_mte/{rel}"
+
+
+def test_default_data_root_is_d_drive(fake, beamline):
+    d = PIMTEDetector(name="mte", poll_period=0)
+    assert d.write_dir == Path("D:/data/12.0.2.1/pi_mte")
+    assert d.read_dir == "/data/12.0.2.1/pi_mte"
+
+
+def test_unset_beamline_falls_back_and_warns(fake, beamline, monkeypatch, caplog):
+    beamline["bl"] = ""
+    monkeypatch.setattr(paths_mod, "_warned", False)
+    d = PIMTEDetector(name="mte", poll_period=0)
+    with caplog.at_level("WARNING"):
+        assert d.write_dir == Path("D:/data/pi_mte")
+        assert d.read_dir == "/data/pi_mte"
+    assert "tiled_beamline preference is unset" in caplog.text
+
+
+def test_explicit_dirs_win(tmp_path, fake, beamline):
+    d = PIMTEDetector(name="mte", write_dir=tmp_path / "w", read_dir="/elsewhere/mte",
+                      data_root="E:/x", poll_period=0)
+    assert d.write_dir == tmp_path / "w"
+    assert d.read_dir == "/elsewhere/mte"
+    only_write = PIMTEDetector(name="mte", write_dir=tmp_path / "w", poll_period=0)
+    local, uri = only_write._file_paths()
+    assert uri == local.as_uri()               # write_dir alone: local URI, as before
+    only_read = PIMTEDetector(name="mte", read_dir="/elsewhere/mte", data_root=tmp_path,
+                              poll_period=0)
+    assert only_read.write_dir == Path(f"{tmp_path}/12.0.2.1/pi_mte")
+    assert only_read.read_dir == "/elsewhere/mte"
 
 
 def test_packaged_happi_entry_instantiates_without_hardware():

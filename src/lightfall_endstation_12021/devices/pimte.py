@@ -7,11 +7,15 @@ while this device holds it; :meth:`PIMTEDetector.release_camera` hands it back.
 The component layout follows ophyd's areaDetector naming so Lightfall's camera widgets
 and plans (``simple_acquire``, TV mode, dark frames) work unchanged::
 
-    det = PIMTEDetector(name="mte", serial="02062413",
-                        write_dir=r"D:\\data\\mte",            # where this PC writes
-                        read_dir="/mnt/beamline/data/mte")   # same dir as the Tiled server sees it
+    det = PIMTEDetector(name="mte", serial="02062413", data_root="D:/data")
     det.cam.acquire_time.set(0.5)      # seconds
     RE(bp.count([det], num=3))
+
+By default files go to ``<data_root>/<tiled_beamline>/pi_mte`` on this PC and are
+referenced as ``/data/<tiled_beamline>/pi_mte`` (the Tiled server's view, where
+shussebora copies them); explicit ``write_dir`` / ``read_dir`` override that. After each
+file is closed (``unstage``), shussebora is told through
+``lightfall.services.shussebora_files.notify_files_closed``.
 
 Images are never put inline in events. Each stage() opens one HDF5 file (SWMR, dataset
 ``/entry/data/data``, one chunk per trigger) and emits a ``StreamResource``; each
@@ -49,9 +53,29 @@ from ophyd import Device, Signal
 from ophyd.status import DeviceStatus
 from ophyd.utils import DisconnectedError, ReadOnlyError
 
+from lightfall_endstation_12021.devices.paths import beamline_dirs
 from lightfall_endstation_12021.devices.picam import PicamCamera, PicamError
 
 logger = logging.getLogger(__name__)
+
+DETECTOR_DIR = "pi_mte"   # per-detector directory under <data_root>/<beamline>/
+
+
+def _notify_files_closed(paths: list[str]) -> None:
+    """Tell shussebora the files are complete. Never raises.
+
+    Older Lightfall versions lack the helper; then shussebora's catch-up moves the files.
+    """
+    try:
+        from lightfall.services.shussebora_files import notify_files_closed
+    except ImportError:
+        logger.debug("lightfall.services.shussebora_files unavailable; not notifying shussebora")
+        return
+    try:
+        notify_files_closed(paths)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("shussebora file.closed notification failed: %s", exc)
+
 
 SAFE_SETPOINT = 20.0   # degC; below this requires allow_cooling
 DETECTOR_IDLE, DETECTOR_ACQUIRE, DETECTOR_ERROR, DETECTOR_DISCONNECTED = 0, 1, 6, 9
@@ -315,9 +339,12 @@ class PIMTEDetector(Device, Triggerable):
     Parameters
     ----------
     serial : camera serial number (None = first free PICam camera)
-    write_dir : directory this PC writes HDF5 files into (YYYY/MM/DD subfolders are added)
+    write_dir : directory this PC writes HDF5 files into (YYYY/MM/DD subfolders are added);
+                default ``<data_root>/<tiled_beamline>/pi_mte``, resolved at stage time
     read_dir : the same directory as seen by the Tiled server (POSIX or Windows path);
-               defaults to ``write_dir``
+               default ``/data/<tiled_beamline>/pi_mte``, or ``write_dir`` when only
+               ``write_dir`` is given
+    data_root : local root that shussebora moves to bcgtiled's ``/data``
     dataset : HDF5 dataset path for the frames
     poll_period : seconds between temperature polls while connected (0 disables)
     """
@@ -326,14 +353,16 @@ class PIMTEDetector(Device, Triggerable):
     image = Cpt(PIMTEImage, "", kind="omitted")
 
     def __init__(self, *args, serial: str | None = None,
-                 write_dir: str | os.PathLike = Path.home() / "lightfall" / "data" / "pi_mte",
-                 read_dir: str | None = None, dataset: str = "/entry/data/data",
+                 write_dir: str | os.PathLike | None = None,
+                 read_dir: str | None = None, data_root: str | os.PathLike = "D:/data",
+                 dataset: str = "/entry/data/data",
                  poll_period: float = 2.0, **kwargs):
         self._serial = serial
         self._driver: PicamCamera | None = None
         self._released = False
         self._open_lock = threading.Lock()
-        self.write_dir = Path(write_dir)
+        self.data_root = str(data_root)
+        self.write_dir = write_dir
         self.read_dir = read_dir
         self.dataset = dataset
         self.poll_period = poll_period
@@ -433,13 +462,38 @@ class PIMTEDetector(Device, Triggerable):
         return (n, *hw) if n > 1 else hw
 
     # ---- file / document bookkeeping
+    @property
+    def write_dir(self) -> Path:
+        """Local write directory: the explicit one, else from ``tiled_beamline`` now."""
+        if self._write_dir is not None:
+            return Path(self._write_dir)
+        return Path(beamline_dirs(DETECTOR_DIR, self.data_root)[0])
+
+    @write_dir.setter
+    def write_dir(self, value: str | os.PathLike | None):
+        self._write_dir = value
+
+    @property
+    def read_dir(self) -> str | None:
+        """Tiled-server view of :attr:`write_dir` (``None``: same as ``write_dir``)."""
+        if self._read_dir is not None:
+            return str(self._read_dir)
+        if self._write_dir is not None:
+            return None   # only write_dir given: reference the local file as before
+        return beamline_dirs(DETECTOR_DIR, self.data_root)[1]
+
+    @read_dir.setter
+    def read_dir(self, value: str | None):
+        self._read_dir = value
+
     def _file_paths(self) -> tuple[Path, str]:
         parts = (time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"),
                  f"{self.name}_{uuid.uuid4().hex[:12]}.h5")
         local = self.write_dir.joinpath(*parts).resolve()
-        if self.read_dir is None:
+        read_dir = self.read_dir
+        if read_dir is None:
             return local, local.as_uri()
-        rd = str(self.read_dir)
+        rd = str(read_dir)
         base = PureWindowsPath(rd) if PureWindowsPath(rd).drive else PurePosixPath(rd)
         return local, base.joinpath(*parts).as_uri()
 
@@ -461,8 +515,10 @@ class PIMTEDetector(Device, Triggerable):
         if self._acq_thread is not None:
             self._acq_thread.join()
         if self._writer is not None:
+            path = self._writer.path
             self._writer.close()
             self._writer = None
+            _notify_files_closed([str(path)])
         return super().unstage()
 
     def describe(self):
