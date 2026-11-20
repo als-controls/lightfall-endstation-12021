@@ -35,7 +35,12 @@ beamline-specific functionality, registered via the `lightfall.plugins` entry po
   works, and stop takes effect within ~0.1 s even mid-readout.
 - `python scripts/evaluate_picam.py` characterizes the driver on the live camera.
 - `write_dir` is where this PC writes HDF5; `read_dir` is the same location as the
-  Tiled server sees it (must be within the server's readable storage).
+  Tiled server sees it (must be within the server's readable storage). Defaults,
+  resolved at stage time from Lightfall's `tiled_beamline` preference:
+  `write_dir = <data_root>/<tiled_beamline>/pi_mte` (`data_root` kwarg, default
+  `D:/data`) and `read_dir = /data/<tiled_beamline>/pi_mte`. With the preference
+  unset the beamline level is left out (warning logged). Explicit `write_dir` /
+  `read_dir` kwargs win; `write_dir` alone keeps the local `file://` URI.
 - Lowering `cam.temperature_setpoint` starts cooling. Only cool the in-vacuum MTE when
   it is under vacuum. Setpoints below 20 °C are refused unless `det.allow_cooling` is
   True (the widget's "Allow cooling" checkbox, which asks for confirmation).
