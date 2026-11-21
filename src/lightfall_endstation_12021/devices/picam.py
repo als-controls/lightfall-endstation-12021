@@ -180,6 +180,56 @@ class _PicamLib:
                 cls._owns_init = False
 
 
+def _list_cameras(dll, serial: str | None) -> list[tuple[_CameraID, bool]]:
+    """``(camera id, in use by another process)`` for each matching camera PICam sees.
+
+    Enumeration only: no camera is opened, so this never takes a camera from LightField.
+    """
+    found = []
+    for fn, in_use in (("Picam_GetAvailableCameraIDs", False),
+                       ("Picam_GetUnavailableCameraIDs", True)):
+        arr, n = C.POINTER(_CameraID)(), C.c_int()
+        err = getattr(dll, fn)(C.byref(arr), C.byref(n))
+        if err:
+            raise PicamError(f"{fn} failed (error {err})", err)
+        try:
+            for i in range(n.value):
+                cid = _CameraID.from_buffer_copy(arr[i])
+                if serial is None or cid.serial_number.decode() == serial:
+                    found.append((cid, in_use))
+        finally:
+            dll.Picam_DestroyCameraIDs(arr)
+    return found
+
+
+#: :func:`camera_presence` results.
+PRESENT_FREE, PRESENT_IN_USE, ABSENT = "free", "in_use", "absent"
+
+
+def camera_presence(serial: str | None = None) -> str:
+    """Whether a camera is plugged in, without opening it.
+
+    Returns :data:`PRESENT_FREE` (present and openable), :data:`PRESENT_IN_USE`
+    (present but open in another process, e.g. LightField) or :data:`ABSENT` (not
+    seen, or the PICam runtime isn't available).
+    """
+    try:
+        dll = _PicamLib.acquire()
+    except Exception as exc:
+        logger.debug("PICam runtime unavailable: %s", exc)
+        return ABSENT
+    try:
+        found = _list_cameras(dll, serial)
+    except Exception as exc:
+        logger.debug("PICam camera enumeration failed: %s", exc)
+        return ABSENT
+    finally:
+        _PicamLib.release()
+    if any(not in_use for _, in_use in found):
+        return PRESENT_FREE
+    return PRESENT_IN_USE if found else ABSENT
+
+
 # --------------------------------------------------------------------------- driver
 class PicamCamera:
     """One open PICam camera: parameters, constraints, ROI and asynchronous acquisition.
@@ -232,16 +282,7 @@ class PicamCamera:
             raise PicamError(f"{what}: {self.enum_string(ET_ERROR, err)} (error {err})", err)
 
     def _find_camera(self, serial):
-        found = []
-        for fn, in_use in (("Picam_GetAvailableCameraIDs", False),
-                           ("Picam_GetUnavailableCameraIDs", True)):
-            arr, n = C.POINTER(_CameraID)(), C.c_int()
-            self._check(getattr(self._dll, fn)(C.byref(arr), C.byref(n)), fn)
-            for i in range(n.value):
-                cid = _CameraID.from_buffer_copy(arr[i])
-                if serial is None or cid.serial_number.decode() == serial:
-                    found.append((cid, in_use))
-            self._dll.Picam_DestroyCameraIDs(arr)
+        found = _list_cameras(self._dll, serial)
         free = [c for c, in_use in found if not in_use]
         if free:
             return free[0]
