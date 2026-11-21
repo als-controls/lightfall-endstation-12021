@@ -54,9 +54,18 @@ from ophyd.status import DeviceStatus
 from ophyd.utils import DisconnectedError, ReadOnlyError
 
 from lightfall_endstation_12021.devices.paths import beamline_dirs
-from lightfall_endstation_12021.devices.picam import PicamCamera, PicamError
+from lightfall_endstation_12021.devices.picam import (
+    ABSENT,
+    PicamCamera,
+    PicamError,
+    camera_presence,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Main-thread answer before the first presence probe has finished (see
+#: PIMTEDetector._camera_presence): treated as present.
+PRESENT_UNKNOWN = "unknown"
 
 DETECTOR_DIR = "pi_mte"   # per-detector directory under <data_root>/<beamline>/
 
@@ -140,7 +149,7 @@ class PicamParamSignal(Signal):
 
     @property
     def connected(self) -> bool:
-        return not self.root.released   # lazily opens on first read
+        return self.root.camera_present   # opens lazily on first read; never here
 
     @property
     def enum_strs(self):
@@ -238,7 +247,7 @@ class _ShutterControlSignal(Signal):
 
     @property
     def connected(self) -> bool:
-        return not self.root.released   # lazily opens on first read
+        return self.root.camera_present   # opens lazily on first read; never here
 
     def get(self, **kwargs):
         closed = self.root.driver.get("Shutter Timing Mode") == "Always Closed"
@@ -361,6 +370,10 @@ class PIMTEDetector(Device, Triggerable):
         self._driver: PicamCamera | None = None
         self._released = False
         self._open_lock = threading.Lock()
+        # camera_presence() cache: (result, time.monotonic() when probed)
+        self._presence: tuple[str, float] | None = None
+        self._presence_lock = threading.Lock()
+        self._presence_thread: threading.Thread | None = None
         self.data_root = str(data_root)
         self.write_dir = write_dir
         self.read_dir = read_dir
@@ -378,6 +391,57 @@ class PIMTEDetector(Device, Triggerable):
     @property
     def camera_connected(self) -> bool:
         return self._driver is not None and self._driver.is_open
+
+    #: Seconds a presence probe result is reused (ophyd polls ``connected`` on every
+    #: signal, every 50 ms, while waiting for a connection).
+    PRESENCE_TTL = 10.0
+
+    @property
+    def camera_present(self) -> bool:
+        """True if the camera is open here, or plugged in (even if LightField has it).
+
+        This is what the signals' ``connected`` reports, so an unplugged camera shows
+        as disconnected rather than connected-but-every-read-fails. It never opens the
+        camera: PICam allows one owner, and LightField may be that owner. False once
+        released (:meth:`release_camera`).
+        """
+        if self._released:
+            return False
+        if self.camera_connected:
+            return True
+        return self._camera_presence() != ABSENT
+
+    def _camera_presence(self) -> str:
+        """Cached :func:`camera_presence`. On the main (GUI) thread never blocks: a
+        stale result is refreshed in the background and the last result is returned
+        meanwhile. Before the first probe the answer there is "present" (the old,
+        optimistic behaviour): ophyd's ``read()`` checks ``connected`` first, so
+        answering ABSENT would fail a good camera's first read. In practice the
+        connection check (a worker thread) probes first."""
+        cached = self._presence
+        if cached is not None and time.monotonic() - cached[1] < self.PRESENCE_TTL:
+            return cached[0]
+        if threading.current_thread() is threading.main_thread():
+            self._refresh_presence_in_background()
+            return cached[0] if cached is not None else PRESENT_UNKNOWN
+        return self._probe_presence()
+
+    def _probe_presence(self) -> str:
+        with self._presence_lock:
+            cached = self._presence
+            if cached is not None and time.monotonic() - cached[1] < self.PRESENCE_TTL:
+                return cached[0]  # another thread just probed
+            result = camera_presence(self._serial)
+            self._presence = (result, time.monotonic())
+            return result
+
+    def _refresh_presence_in_background(self):
+        thread = self._presence_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._presence_thread = threading.Thread(
+            target=self._probe_presence, daemon=True, name=f"{self.name}-presence")
+        self._presence_thread.start()
 
     @property
     def released(self) -> bool:

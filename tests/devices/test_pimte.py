@@ -98,8 +98,27 @@ class FakePicam:
         self.is_open = False
 
 
+class FakePresence:
+    """Stands in for picam.camera_presence (never touches the PICam runtime)."""
+
+    def __init__(self):
+        self.result = "free"
+        self.calls = 0
+
+    def __call__(self, serial=None):
+        self.calls += 1
+        return self.result
+
+
 @pytest.fixture
-def fake(monkeypatch):
+def presence(monkeypatch):
+    p = FakePresence()
+    monkeypatch.setattr(pimte_mod, "camera_presence", p)
+    return p
+
+
+@pytest.fixture
+def fake(monkeypatch, presence):
     monkeypatch.setattr(pimte_mod, "PicamCamera", FakePicam)
     FakePicam.instances = 0
 
@@ -515,3 +534,75 @@ def test_manifest_entry_point_resolves():
     for entry in manifest.plugins:
         mod, _, attr = entry.import_path.partition(":")
         assert getattr(__import__(mod, fromlist=[attr]), attr)
+
+
+# ---- connected reflects whether the camera is plugged in (never opens it)
+
+def _off_main_thread(fn):
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("v", fn()))
+    t.start()
+    t.join(5)
+    return out["v"]
+
+
+def test_absent_camera_is_not_connected_and_not_opened(det, presence):
+    presence.result = "absent"
+    assert _off_main_thread(lambda: det.cam.temperature.connected) is False
+    assert _off_main_thread(lambda: det.connected) is False
+    assert FakePicam.instances == 0
+
+
+def test_camera_in_use_elsewhere_counts_as_connected(det, presence):
+    presence.result = "in_use"   # LightField has it: present, just not ours
+    assert _off_main_thread(lambda: det.connected) is True
+    assert FakePicam.instances == 0
+
+
+def test_wait_for_connection_fails_fast_for_absent_camera(det, presence):
+    presence.result = "absent"
+    err = _off_main_thread(lambda: _caught(lambda: det.wait_for_connection(timeout=0.3)))
+    assert isinstance(err, TimeoutError)
+    assert presence.calls == 1          # one probe shared by every signal (cached)
+    assert FakePicam.instances == 0
+
+
+def _caught(fn):
+    try:
+        fn()
+    except Exception as exc:
+        return exc
+    return None
+
+
+def test_presence_is_cached_then_reprobed(det, presence, monkeypatch):
+    monkeypatch.setattr(PIMTEDetector, "PRESENCE_TTL", 0.05)
+    presence.result = "absent"
+    assert _off_main_thread(lambda: det.camera_present) is False
+    presence.result = "free"             # plugged back in
+    assert _off_main_thread(lambda: det.camera_present) is False   # still cached
+    time.sleep(0.1)
+    assert _off_main_thread(lambda: det.camera_present) is True
+    assert presence.calls == 2
+
+
+def test_open_camera_is_connected_without_probing(det, presence):
+    det.driver  # open
+    presence.result = "absent"           # would say otherwise, but we own it
+    assert det.connected is True
+    assert presence.calls == 0
+
+
+def test_main_thread_never_blocks_on_probe(det, presence):
+    assert threading.current_thread() is threading.main_thread()
+    presence.result = "absent"
+    assert det.camera_present is True    # unknown yet: old optimistic answer
+    _wait(lambda: det._presence is not None)
+    assert det.camera_present is False   # background probe landed
+    assert FakePicam.instances == 0
+
+
+def test_released_camera_is_not_connected_and_not_probed(det, presence):
+    det.release_camera()
+    assert det.connected is False
+    assert presence.calls == 0
