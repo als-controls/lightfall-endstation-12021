@@ -9,7 +9,7 @@
     "kwargs": {
       "name": "{{name}}",
       "serial": "02062413",
-      "data_root": "D:/data"
+      "data_root": "C:/data"
     },
     "beamline": "12.0.2.1",
     "display_name": "PI-MTE 2048B",
